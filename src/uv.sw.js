@@ -30,17 +30,21 @@ const emptyMethods = ['GET', 'HEAD'];
 class UVServiceWorker extends Ultraviolet.EventEmitter {
     constructor(config = __uv$config) {
         super();
-        if (!config.bare) config.bare = '/bare/';
         if (!config.prefix) config.prefix = '/service/';
         this.config = config;
-        const addresses = (
-            Array.isArray(config.bare) ? config.bare : [config.bare]
-        ).map((str) => new URL(str, location).toString());
-        this.address = addresses[~~(Math.random() * addresses.length)];
         /**
          * @type {InstanceType<Ultraviolet['BareClient']>}
          */
         this.bareClient = new Ultraviolet.BareClient();
+    }
+    /**
+     *
+     * @param {Event & {request: Request}} param0
+     * @returns
+     */
+    route({ request }) {
+        if (request.url.startsWith(location.origin + this.config.prefix)) return true;
+        else return false;
     }
     /**
      *
@@ -57,7 +61,7 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
             if (!request.url.startsWith(location.origin + this.config.prefix))
                 return await fetch(request);
 
-            const ultraviolet = new Ultraviolet(this.config, this.address);
+            const ultraviolet = new Ultraviolet(this.config);
 
             if (typeof this.config.construct === 'function') {
                 this.config.construct(ultraviolet, 'service');
@@ -72,7 +76,6 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
 
             const requestCtx = new RequestContext(
                 request,
-                this,
                 ultraviolet,
                 !emptyMethods.includes(request.method.toUpperCase())
                     ? await request.blob()
@@ -130,10 +133,7 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
                 method: requestCtx.method,
                 body: requestCtx.body,
                 credentials: requestCtx.credentials,
-                mode:
-                    location.origin !== requestCtx.address.origin
-                        ? 'cors'
-                        : requestCtx.mode,
+                mode: requestCtx.mode,
                 cache: requestCtx.cache,
                 redirect: requestCtx.redirect,
             });
@@ -155,8 +155,8 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
             }
 
             // downloads
-            if (request.destination === 'document') {
-                const header = responseCtx.headers['content-disposition'];
+            if (["document", "iframe"].includes(request.destination)) {
+                const header = responseCtx.getHeader("content-disposition");
 
                 // validate header and test for filename
                 if (!/\s*?((inline|attachment);\s*?)filename=/i.test(header)) {
@@ -200,6 +200,10 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
             if (responseCtx.body) {
                 switch (request.destination) {
                     case 'script':
+                        responseCtx.body = ultraviolet.js.rewrite(
+                            await response.text()
+                        );
+                        break;
                     case 'worker':
                         {
                             // craft a JS-safe list of arguments
@@ -211,19 +215,18 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
                             ]
                                 .map((script) => JSON.stringify(script))
                                 .join(',');
-                            responseCtx.body = `if (!self.__uv && self.importScripts) { ${ultraviolet.createJsInject(
-                                this.address,
-                                this.bareClient.manifest,
+                            responseCtx.body = `(async ()=>{${ultraviolet.createJsInject(
                                 ultraviolet.cookie.serialize(
                                     cookies,
                                     ultraviolet.meta,
                                     true
                                 ),
                                 request.referrer
-                            )} importScripts(${scripts}); }\n`;
+                            )} importScripts(${scripts}); await __uv$promise;\n`;
                             responseCtx.body += ultraviolet.js.rewrite(
                                 await response.text()
                             );
+							responseCtx.body += "\n})()";
                         }
                         break;
                     case 'style':
@@ -233,14 +236,44 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
                         break;
                     case 'iframe':
                     case 'document':
-                        if (
-                            isHtml(
-                                ultraviolet.meta.url,
-                                responseCtx.headers['content-type'] || ''
-                            )
-                        ) {
+                        if (responseCtx.getHeader("content-type") && responseCtx.getHeader("content-type").startsWith("text/html")) {
+                            let modifiedResponse = await response.text();
+                            if (Array.isArray(this.config.inject)) {
+                                const headPosition = modifiedResponse.indexOf('<head>');
+                                const upperHead = modifiedResponse.indexOf('<HEAD>');
+                                const bodyPosition = modifiedResponse.indexOf('<body>');
+                                const upperBody = modifiedResponse.indexOf('<BODY>');
+                                const url = new URL(fetchedURL)
+                                const injectArray = this.config.inject;
+                                for (const inject of injectArray) {
+                                    const regex = new RegExp(inject.host)
+                                    if (regex.test(url.host)) {
+                                        if (inject.injectTo === "head") {
+                                            if (headPosition !== -1 || upperHead !== -1) {
+                                                modifiedResponse =
+                                                    modifiedResponse.slice(
+                                                        0,
+                                                        headPosition
+                                                    ) +
+                                                    `${inject.html}` +
+                                                    modifiedResponse.slice(headPosition);
+                                            }
+                                        } else if (inject.injectTo === "body") {
+                                            if (bodyPosition !== -1 || upperBody !== -1) {
+                                                modifiedResponse =
+                                                    modifiedResponse.slice(
+                                                        0,
+                                                        bodyPosition
+                                                    ) +
+                                                    `${inject.html}` +
+                                                    modifiedResponse.slice(bodyPosition);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             responseCtx.body = ultraviolet.rewriteHtml(
-                                await response.text(),
+                                modifiedResponse,
                                 {
                                     document: true,
                                     injectHead: ultraviolet.createHtmlInject(
@@ -248,8 +281,6 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
                                         ultraviolet.bundleScript,
                                         ultraviolet.clientScript,
                                         ultraviolet.configScript,
-                                        this.address,
-                                        this.bareClient.manifest,
                                         ultraviolet.cookie.serialize(
                                             cookies,
                                             ultraviolet.meta,
@@ -260,6 +291,9 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
                                 }
                             );
                         }
+                        break;
+                    default:
+                        break;
                 }
             }
 
@@ -285,7 +319,7 @@ class UVServiceWorker extends Ultraviolet.EventEmitter {
 
             console.error(err);
 
-            return renderError(err, fetchedURL, this.address);
+            return renderError(err, fetchedURL);
         }
     }
     static Ultraviolet = Ultraviolet;
@@ -320,22 +354,28 @@ class ResponseContext {
     set base(val) {
         this.request.base = val;
     }
+    //the header value might be an array, so this function is used to 
+    //retrieve the value when it needs to be compared against a string
+    getHeader(key) {
+        if (Array.isArray(this.headers[key])) {
+            return this.headers[key][0];
+        }
+        return this.headers[key];
+    }
 }
 
 class RequestContext {
     /**
      *
      * @param {Request} request
-     * @param {UVServiceWorker} worker
      * @param {Ultraviolet} ultraviolet
      * @param {BodyInit} body
      */
-    constructor(request, worker, ultraviolet, body = null) {
+    constructor(request, ultraviolet, body = null) {
         this.ultraviolet = ultraviolet;
         this.request = request;
         this.headers = Object.fromEntries(request.headers.entries());
         this.method = request.method;
-        this.address = worker.address;
         this.body = body || null;
         this.cache = request.cache;
         this.redirect = request.redirect;
@@ -355,15 +395,6 @@ class RequestContext {
     set base(val) {
         this.ultraviolet.meta.base = val;
     }
-}
-
-function isHtml(url, contentType = '') {
-    return (
-        (
-            Ultraviolet.mime.contentType(contentType || url.pathname) ||
-            'text/html'
-        ).split(';')[0] === 'text/html'
-    );
 }
 
 class HookEvent {
@@ -390,178 +421,75 @@ class HookEvent {
 
 /**
  *
- * @param {string} fetchedURL
- * @param {string} bareServer
- * @returns
- */
-function hostnameErrorTemplate(fetchedURL, bareServer) {
-    const parsedFetchedURL = new URL(fetchedURL);
-    const script =
-        `remoteHostname.textContent = ${JSON.stringify(
-            parsedFetchedURL.hostname
-        )};` +
-        `bareServer.href = ${JSON.stringify(bareServer)};` +
-        `uvHostname.textContent = ${JSON.stringify(location.hostname)};` +
-        `reload.addEventListener("click", () => location.reload());` +
-        `uvVersion.textContent = ${JSON.stringify(
-            process.env.ULTRAVIOLET_VERSION
-        )};`;
-
-    return (
-        '<!DOCTYPE html>' +
-        '<html>' +
-        '<head>' +
-        "<meta charset='utf-8' />" +
-        '<title>Error</title>' +
-        '<style>' +
-        '* { background-color: white }' +
-        '</style>' +
-        '</head>' +
-        '<body>' +
-        '<h1>This site can’t be reached</h1>' +
-        '<hr />' +
-        '<p><b id="remoteHostname"></b>’s server IP address could not be found.</p>' +
-        '<p>Try:</p>' +
-        '<ul>' +
-        '<li>Verifying you entered the correct address</li>' +
-        '<li>Clearing the site data</li>' +
-        '<li>Contacting <b id="uvHostname"></b>\'s administrator</li>' +
-        "<li>Verifying the <a id='bareServer' title='Bare server'>Bare server</a> isn't censored</li>" +
-        '</ul>' +
-        '<button id="reload">Reload</button>' +
-        '<hr />' +
-        '<p><i>Ultraviolet v<span id="uvVersion"></span></i></p>' +
-        `<script src="${
-            'data:application/javascript,' + encodeURIComponent(script)
-        }"></script>` +
-        '</body>' +
-        '</html>'
-    );
-}
-
-/**
- *
- * @param {string} title
- * @param {string} code
- * @param {string} id
- * @param {string} message
  * @param {string} trace
  * @param {string} fetchedURL
- * @param {string} bareServer
  * @returns
  */
 function errorTemplate(
-    title,
-    code,
-    id,
-    message,
     trace,
     fetchedURL,
-    bareServer
 ) {
-    // produced by bare-server-node
-    if (message === 'The specified host could not be resolved.')
-        return hostnameErrorTemplate(fetchedURL, bareServer);
-
     // turn script into a data URI so we don't have to escape any HTML values
-    const script =
-        `errorTitle.textContent = ${JSON.stringify(title)};` +
-        `errorCode.textContent = ${JSON.stringify(code)};` +
-        (id ? `errorId.textContent = ${JSON.stringify(id)};` : '') +
-        `errorMessage.textContent =  ${JSON.stringify(message)};` +
-        `errorTrace.value = ${JSON.stringify(trace)};` +
-        `fetchedURL.textContent = ${JSON.stringify(fetchedURL)};` +
-        `bareServer.href = ${JSON.stringify(bareServer)};` +
-        `for (const node of document.querySelectorAll("#uvHostname")) node.textContent = ${JSON.stringify(
+    const script = `
+        errorTrace.value = ${JSON.stringify(trace)};
+        fetchedURL.textContent = ${JSON.stringify(fetchedURL)};
+        for (const node of document.querySelectorAll("#uvHostname")) node.textContent = ${JSON.stringify(
             location.hostname
-        )};` +
-        `reload.addEventListener("click", () => location.reload());` +
-        `uvVersion.textContent = ${JSON.stringify(
+        )};
+        reload.addEventListener("click", () => location.reload());
+        uvVersion.textContent = ${JSON.stringify(
             process.env.ULTRAVIOLET_VERSION
-        )};`;
+        )};
+    `
 
     return (
-        '<!DOCTYPE html>' +
-        '<html>' +
-        '<head>' +
-        "<meta charset='utf-8' />" +
-        '<title>Error</title>' +
-        '<style>' +
-        '* { background-color: white }' +
-        '</style>' +
-        '</head>' +
-        '<body>' +
-        "<h1 id='errorTitle'></h1>" +
-        '<hr />' +
-        '<p>Failed to load <b id="fetchedURL"></b></p>' +
-        '<p id="errorMessage"></p>' +
-        '<table><tbody>' +
-        '<tr><td>Code:</td><td id="errorCode"></td></tr>' +
-        (id ? '<tr><td>ID:</td><td id="errorId"></td></tr>' : '') +
-        '</tbody></table>' +
-        '<textarea id="errorTrace" cols="40" rows="10" readonly></textarea>' +
-        '<p>Try:</p>' +
-        '<ul>' +
-        '<li>Checking your internet connection</li>' +
-        '<li>Verifying you entered the correct address</li>' +
-        '<li>Clearing the site data</li>' +
-        '<li>Contacting <b id="uvHostname"></b>\'s administrator</li>' +
-        "<li>Verify the <a id='bareServer' title='Bare server'>Bare server</a> isn't censored</li>" +
-        '</ul>' +
-        '<p>If you\'re the administrator of <b id="uvHostname"></b>, try:</p>' +
-        '<ul>' +
-        '<li>Restarting your Bare server</li>' +
-        '<li>Updating Ultraviolet</li>' +
-        '<li>Troubleshooting the error on the <a href="https://github.com/titaniumnetwork-dev/Ultraviolet" target="_blank">GitHub repository</a></li>' +
-        '</ul>' +
-        '<button id="reload">Reload</button>' +
-        '<hr />' +
-        '<p><i>Ultraviolet v<span id="uvVersion"></span></i></p>' +
-        `<script src="${
+        `<!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset='utf-8' />
+        <title>Error</title>
+        <style>
+        * { background-color: white }
+        </style>
+        </head>
+        <body>
+        <h1 id='errorTitle'>Error processing your request</h1>
+        <hr />
+        <p>Failed to load <b id="fetchedURL"></b></p>
+        <p id="errorMessage">Internal Server Error</p>
+        <textarea id="errorTrace" cols="40" rows="10" readonly></textarea>
+        <p>Try:</p>
+        <ul>
+        <li>Checking your internet connection</li>
+        <li>Verifying you entered the correct address</li>
+        <li>Clearing the site data</li>
+        <li>Contacting <b id="uvHostname"></b>'s administrator</li>
+        <li>Verify the server isn't censored</li>
+        </ul>
+        <p>If you're the administrator of <b id="uvHostname"></b>, try:</p>
+        <ul>
+        <li>Restarting your server</li>
+        <li>Updating Ultraviolet</li>
+        <li>Troubleshooting the error on the <a href="https://github.com/titaniumnetwork-dev/Ultraviolet" target="_blank">GitHub repository</a></li>
+        </ul>
+        <button id="reload">Reload</button>
+        <hr />
+        <p><i>Ultraviolet v<span id="uvVersion"></span></i></p>
+        <script src="${
             'data:application/javascript,' + encodeURIComponent(script)
-        }"></script>` +
-        '</body>' +
-        '</html>'
+        }"></script>
+        </body>
+        </html>
+        `
     );
-}
-
-/**
- * @typedef {import("@mercuryworkshop/bare-mux").BareError} BareError
- */
-
-/**
- *
- * @param {unknown} err
- * @returns {err is BareError}
- */
-function isBareError(err) {
-    return err instanceof Error && typeof err.body === 'object';
 }
 
 /**
  *
  * @param {unknown} err
  * @param {string} fetchedURL
- * @param {string} bareServer
  */
-function renderError(err, fetchedURL, bareServer) {
-    /**
-     * @type {number}
-     */
-    let status;
-    /**
-     * @type {string}
-     */
-    let title;
-    /**
-     * @type {string}
-     */
-    let code;
-    let id = '';
-    /**
-     * @type {string}
-     */
-    let message;
+function renderError(err, fetchedURL) {
     let headers = {
         'content-type': 'text/html',
     };
@@ -569,31 +497,13 @@ function renderError(err, fetchedURL, bareServer) {
         headers['Cross-Origin-Embedder-Policy'] = 'require-corp';
     }
 
-    if (isBareError(err)) {
-        status = err.status;
-        title = 'Error communicating with the Bare server';
-        message = err.body.message;
-        code = err.body.code;
-        id = err.body.id;
-    } else {
-        status = 500;
-        title = 'Error processing your request';
-        message = 'Internal Server Error';
-        code = err instanceof Error ? err.name : 'UNKNOWN';
-    }
-
     return new Response(
         errorTemplate(
-            title,
-            code,
-            id,
-            message,
             String(err),
-            fetchedURL,
-            bareServer
+            fetchedURL
         ),
         {
-            status,
+            status: 500,
             headers: headers
         }
     );

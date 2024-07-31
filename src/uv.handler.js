@@ -13,15 +13,6 @@ const UVClient = self.UVClient;
  */
 const __uv$config = self.__uv$config;
 
-/**
- * @type {import('@mercuryworkshop/bare-mux').BareManifest}
- */
-const __uv$bareData = self.__uv$bareData;
-
-/**
- * @type {string}
- */
-const __uv$bareURL = self.__uv$bareURL;
 
 /**
  * @type {string}
@@ -29,8 +20,6 @@ const __uv$bareURL = self.__uv$bareURL;
 const __uv$cookies = self.__uv$cookies;
 
 if (
-    typeof __uv$bareData !== 'object' ||
-    typeof __uv$bareURL !== 'string' ||
     typeof __uv$cookies !== 'string'
 )
     throw new TypeError('Unable to load global UV data');
@@ -39,12 +28,30 @@ if (!self.__uv) __uvHook(self);
 
 self.__uvHook = __uvHook;
 
+function __uvHook(window) {
+	if (!window.window) {
+		window.__uv$promise = new Promise(resolve => {
+			window.onmessage = (e)=>{
+				if (e.data.__data instanceof MessagePort) {
+					__uvHookReal(window, new Ultraviolet.BareClient(e.data.__data));
+					delete window.onmessage;
+					resolve();
+				} else {
+					throw new Error("unreachable: e.data !== MessagePort");
+				}
+			}
+		});
+	} else {
+		__uvHookReal(window, new Ultraviolet.BareClient());
+	}
+}
+
 /**
  *
  * @param {typeof globalThis} window
  * @returns
  */
-function __uvHook(window) {
+function __uvHookReal(window, bareClient) {
     if ('__uv' in window && window.__uv instanceof Ultraviolet) return false;
 
     if (window.document && !!window.window) {
@@ -61,9 +68,6 @@ function __uvHook(window) {
     /*if (typeof config.construct === 'function') {
         config.construct(__uv, worker ? 'worker' : 'window');
     }*/
-
-    // websockets
-    const bareClient = new Ultraviolet.BareClient();
 
     const client = new UVClient(window, bareClient, worker);
     const {
@@ -572,8 +576,6 @@ function __uvHook(window) {
                     __uv.bundleScript,
                     __uv.clientScript,
                     __uv.configScript,
-                    __uv$bareURL,
-                    __uv$bareData,
                     cookieStr,
                     window.location.href
                 ),
@@ -780,8 +782,6 @@ function __uvHook(window) {
                         __uv.bundleScript,
                         __uv.clientScript,
                         __uv.configScript,
-                        __uv$bareURL,
-                        __uv$bareData,
                         cookieStr,
                         window.location.href
                     ),
@@ -892,8 +892,6 @@ function __uvHook(window) {
                     __uv.bundleScript,
                     __uv.clientScript,
                     __uv.configScript,
-                    __uv$bareURL,
-                    __uv$bareData,
                     cookieStr,
                     window.location.href
                 ),
